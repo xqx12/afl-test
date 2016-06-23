@@ -16,12 +16,12 @@ Python AFL (Jakub Wilk)
   Allows fuzz-testing of Python programs. Uses custom instrumentation and its
   own forkserver.
 
-  https://bitbucket.org/jwilk/python-afl
+  http://jwilk.net/software/python-afl
 
 Go-fuzz (Dmitry Vyukov)
 -----------------------
 
-  AFL-style guided fuzzing approach for Go targets:
+  AFL-inspired guided fuzzing approach for Go targets:
 
   https://github.com/dvyukov/go-fuzz
 
@@ -31,6 +31,14 @@ afl.rs (Keegan McAllister)
   Allows Rust features to be easily fuzzed with AFL (using the LLVM mode).
 
   https://github.com/kmcallister/afl.rs
+
+OCaml support (KC Sivaramakrishnan)
+-----------------------------------
+
+  Adds AFL-compatible instrumentation to OCaml programs.
+
+  https://github.com/ocamllabs/opam-repo-dev/pull/23
+  http://canopy.mirage.io/Posts/Fuzzing
 
 AFL for GCJ Java and other GCC frontends (-)
 --------------------------------------------
@@ -48,13 +56,61 @@ AFL-style in-process fuzzer for LLVM (Kostya Serebryany)
 --------------------------------------------------------
 
   Provides an evolutionary instrumentation-guided fuzzing harness that allows
-  some programs to be fuzzed without the fork / execve overhead.
+  some programs to be fuzzed without the fork / execve overhead. (Similar
+  functionality is now available as the "persistent" feature described in
+  ../llvm_mode/README.llvm.)
 
   http://llvm.org/docs/LibFuzzer.html
 
-----------------------------------------
-Crash triage and other helper utilities:
-----------------------------------------
+AFL fixup shim (Ben Nagy)
+-------------------------
+
+  Allows AFL_POST_LIBRARY postprocessors to be written in arbitrary languages
+  that don't have C / .so bindings. Includes examples in Go.
+
+  https://github.com/bnagy/aflfix
+
+----------------
+Network fuzzing:
+----------------
+
+Preeny (Yan Shoshitaishvili)
+----------------------------
+
+  Provides a fairly simple way to convince dynamically linked network-centric
+  programs to read from a file or not fork. Not AFL-specific, but described as
+  useful by many users. Some assembly required.
+
+  https://github.com/zardus/preeny
+
+-------------------------------------------
+Distributed fuzzing and related automation:
+-------------------------------------------
+
+roving (Richo Healey)
+---------------------
+
+  A client-server architecture for effortlessly orchestrating AFL runs across
+  a fleet of machines. You don't want to use this on systems that face the
+  Internet or live in other untrusted environments.
+
+  https://github.com/richo/roving
+
+Distfuzz-AFL (Martijn Bogaard)
+------------------------------
+
+  Simplifies the management of afl-fuzz instances on remote machines. The
+  author notes that the current implementation isn't secure and should not
+  be exposed on the Internet.
+
+  https://github.com/MartijnB/disfuzz-afl
+
+afl-launch (Ben Nagy)
+---------------------
+
+  Batch AFL launcher utility with a simple CLI.
+
+  https://github.com/bnagy/afl-launch
 
 AFL Utils (rc0r)
 ----------------
@@ -70,6 +126,17 @@ afl-fuzzing-scripts (Tobias Ospelt)
 
   https://github.com/floyd-fuh/afl-fuzzing-scripts/
 
+afl-sid (Jacek Wielemborek)
+---------------------------
+
+  Allows users to more conveniently build and deploy AFL via Docker.
+
+  https://github.com/d33tah/afl-sid
+
+-----------------------------------------------------------
+Crash triage, coverage analysis, and other companion tools:
+-----------------------------------------------------------
+
 afl-crash-analyzer (Tobias Ospelt)
 ----------------------------------
 
@@ -84,22 +151,12 @@ Crashwalk (Ben Nagy)
 
   https://github.com/bnagy/crashwalk
 
-Distfuzz-AFL (Martijn Bogaard)
-------------------------------
+afl-cov (Michael Rash)
+----------------------
 
-  Simplifies the management of afl-fuzz instances on remote machines. The
-  author notes that the current implementation isn't secure and should not
-  be exposed on the Internet.
+  Produces human-readable coverage data based on the output queue of afl-fuzz.
 
-  https://github.com/MartijnB/disfuzz-afl
-
-AFL fixup shim (Ben Nagy)
--------------------------
-
-  Allows AFL_POST_LIBRARY postprocessors to be written in arbitrary languages
-  that don't have C / .so bindings. Includes examples in Go.
-
-  https://github.com/bnagy/aflfix
+  https://github.com/mrash/afl-cov
 
 RecidiVM (Jakub Wilk)
 ---------------------
@@ -108,9 +165,39 @@ RecidiVM (Jakub Wilk)
 
   http://jwilk.net/software/recidivm
 
+aflize (Jacek Wielemborek)
+--------------------------
+
+  Automatically build AFL-enabled versions of Debian packages.
+
+  https://github.com/d33tah/aflize
+
+afl-ddmin-mod (Markus Teufelberger)
+-----------------------------------
+
+  A variant of afl-tmin that uses a more sophisticated (but slower)
+  minimization algorithm.
+
+  https://github.com/MarkusTeufelberger/afl-ddmin-mod
+
 -------------------------------
 Narrow-purpose or experimental:
 -------------------------------
+
+Cygwin support (Ali Rizvi-Santiago)
+-----------------------------------
+
+  Pretty self-explanatory. As per the author, this "mostly" ports AFL to
+  Windows. Field reports welcome!
+
+  https://github.com/arizvisa/afl-cygwin
+
+Pause and resume scripts (Ben Nagy)
+-----------------------------------
+
+  Simple automation to suspend and resume groups of fuzzing jobs.
+
+  https://gist.github.com/bnagy/8f0eb29eb125653f73fd
 
 Static binary-only instrumentation (Aleksandar Nikolich)
 --------------------------------------------------------
@@ -154,6 +241,14 @@ AFL harness for fwknop (Michael Rash)
 
   https://github.com/mrash/fwknop/tree/master/test/afl
 
+Building harnesses for DNS servers (Jonathan Foote, Ron Bowes)
+--------------------------------------------------------------
+
+  Two articles outlining the general principles and showing some example code.
+
+  https://www.fastly.com/blog/how-to-fuzz-server-american-fuzzy-lop
+  https://goo.gl/j9EgFf
+
 Fuzzer shell for SQLite (Richard Hipp)
 --------------------------------------
 
@@ -161,3 +256,20 @@ Fuzzer shell for SQLite (Richard Hipp)
 
   http://www.sqlite.org/src/artifact/9e7e273da2030371
 
+Support for Python mutation modules (Christian Holler)
+------------------------------------------------------
+
+  https://github.com/choller/afl/blob/master/docs/mozilla/python_modules.txt
+
+Support for selective instrumentation (Christian Holler)
+--------------------------------------------------------
+
+  https://github.com/choller/afl/blob/master/docs/mozilla/partial_instrumentation.txt
+
+Kernel fuzzing (Dmitry Vyukov)
+------------------------------
+
+  A similar guided approach as applied to fuzzing syscalls:
+
+  https://github.com/google/syzkaller/wiki/Found-Bugs
+  https://github.com/dvyukov/linux/commit/33787098ffaaa83b8a7ccf519913ac5fd6125931

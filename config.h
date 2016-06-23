@@ -4,7 +4,7 @@
 
    Written and maintained by Michal Zalewski <lcamtuf@google.com>
 
-   Copyright 2013, 2014, 2015 Google Inc. All rights reserved.
+   Copyright 2013, 2014, 2015, 2016 Google Inc. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -25,7 +25,8 @@
  *                                                    *
  ******************************************************/
 
-/* Comment out to disable terminal colors: */
+/* Comment out to disable terminal colors (note that this makes afl-analyze
+   a lot less nice): */
 
 #define USE_COLOR
 
@@ -263,6 +264,13 @@
 
 #define CLANG_ENV_VAR       "__AFL_CLANG_MODE"
 #define AS_LOOP_ENV_VAR     "__AFL_AS_LOOPCHECK"
+#define PERSIST_ENV_VAR     "__AFL_PERSISTENT"
+#define DEFER_ENV_VAR       "__AFL_DEFER_FORKSRV"
+
+/* In-code signatures for deferred and persistent mode. */
+
+#define PERSIST_SIG         "##SIG_AFL_PERSISTENT##"
+#define DEFER_SIG           "##SIG_AFL_DEFER_FORKSRV##"
 
 /* Distinctive bitmap signature used to indicate failed execution: */
 
@@ -313,6 +321,7 @@
 /* Constants for afl-gotcpu to control busy loop timing: */
 
 #define  CTEST_TARGET_MS    5000
+#define  CTEST_CORE_TRG_MS  1000
 #define  CTEST_BUSY_CYCLES  (10 * 1000 * 1000)
 
 /* Uncomment this to use inferior block-coverage-based instrumentation. Note
