@@ -27,3 +27,7 @@ test
 test-instr
 .test-instr0
 .test-instr1
+cscope*
+tags
+*.swp
+*.swo

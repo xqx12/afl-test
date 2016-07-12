@@ -201,6 +201,10 @@ bool AFLCoverage::runOnModule(Module &M) {
       new GlobalVariable(M, PointerType::get(Int8Ty, 0), false,
                          GlobalValue::ExternalLinkage, 0, "__afl_area_ptr");
 
+  GlobalVariable *AFLBBMapPtr =
+      new GlobalVariable(M, PointerType::get(Int8Ty, 0), false,
+                         GlobalValue::ExternalLinkage, 0, "__afl_bbcov_ptr");
+
   GlobalVariable *AFLPrevLoc = new GlobalVariable(
       M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_prev_loc",
       0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
@@ -258,6 +262,20 @@ bool AFLCoverage::runOnModule(Module &M) {
       StoreInst *Store =
           IRB.CreateStore(ConstantInt::get(Int32Ty, cur_loc >> 1), AFLPrevLoc);
       Store->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+
+
+      /* Load BBMap SHM pointer, addbyxqx */
+      LoadInst *MapBBPtr = IRB.CreateLoad(AFLBBMapPtr);
+      MapBBPtr->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+      ConstantInt *CurBB = ConstantInt::get(Int32Ty, inst_blocks);
+      Value *MapBBPtrIdx =
+          IRB.CreateGEP(MapBBPtr,IRB.CreateZExt(CurBB, IRB.getInt32Ty()) );
+      /* Update bitmap */
+      LoadInst *BBCounter = IRB.CreateLoad(MapBBPtrIdx);
+      BBCounter->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
+      Value *BBIncr = IRB.CreateAdd(BBCounter, ConstantInt::get(Int8Ty, 1));
+      IRB.CreateStore(BBIncr, MapBBPtrIdx)
+          ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
       inst_blocks++;
 

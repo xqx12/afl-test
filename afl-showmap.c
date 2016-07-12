@@ -49,8 +49,10 @@
 static s32 child_pid;                 /* PID of the tested program         */
 
 static u8* trace_bits;                /* SHM with instrumentation bitmap   */
+static u8* bb_trace_bits;                /* SHM with instrumentation bitmap for bb coverage   */
 
 static u8 *out_file,                  /* Trace output file                 */
+          *bbcov_file,
           *doc_path,                  /* Path to docs                      */
           *target_path,               /* Path to target binary             */
           *at_file;                   /* Substitution string for @@        */
@@ -60,6 +62,7 @@ static u32 exec_tmout;                /* Exec timeout (ms)                 */
 static u64 mem_limit = MEM_LIMIT;     /* Memory limit (MB)                 */
 
 static s32 shm_id;                    /* ID of the SHM region              */
+static s32 bb_shm_id;                    /* ID of the bb cov SHM region              */
 
 static u8  quiet_mode,                /* Hide non-essential messages?      */
            edges_only,                /* Ignore hit counts?                */
@@ -115,6 +118,7 @@ static void classify_counts(u8* mem) {
 static void remove_shm(void) {
 
   shmctl(shm_id, IPC_RMID, NULL);
+  shmctl(bb_shm_id, IPC_RMID, NULL);
 
 }
 
@@ -124,24 +128,81 @@ static void remove_shm(void) {
 static void setup_shm(void) {
 
   u8* shm_str;
+  u8* bb_shm_str;
 
   shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+  bb_shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+  printf("shmid=%d, bb_shm_id=%d\n", shm_id, bb_shm_id);
 
-  if (shm_id < 0) PFATAL("shmget() failed");
+  if (shm_id < 0 )  PFATAL("shmget() failed");
+  if (bb_shm_id < 0 )  PFATAL("shmget() failed");
 
   atexit(remove_shm);
 
   shm_str = alloc_printf("%d", shm_id);
+  bb_shm_str = alloc_printf("%d", bb_shm_id);
 
   setenv(SHM_ENV_VAR, shm_str, 1);
+  setenv(BB_SHM_ENV_VAR, bb_shm_str, 1);
 
   ck_free(shm_str);
+  ck_free(bb_shm_str);
 
   trace_bits = shmat(shm_id, NULL, 0);
+  bb_trace_bits = shmat(bb_shm_id, NULL, 0);
   
   if (!trace_bits) PFATAL("shmat() failed");
+  if (!bb_trace_bits) PFATAL("shmat() for bb failed");
 
 }
+
+/* Write bbcov results. */
+
+static u32 write_bbcov_results(void) {
+
+  s32 fd;
+  FILE* f;
+  u32 i, ret = 0;
+
+  if (!strncmp(bbcov_file, "/dev/", 5)) {
+
+    fd = open(bbcov_file, O_WRONLY, 0600);
+    if (fd < 0) PFATAL("Unable to open '%s'", bbcov_file);
+
+  } else if (!strcmp(bbcov_file, "-")) {
+
+    fd = dup(1);
+    if (fd < 0) PFATAL("Unable to open stdout");
+
+  } else {
+
+    unlink(bbcov_file); /* Ignore errors */
+    fd = open(bbcov_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) PFATAL("Unable to create '%s'", bbcov_file);
+
+  }
+
+  f = fdopen(fd, "w");
+
+  if (!f) PFATAL("fdopen() failed");
+
+  for (i = 0; i < MAP_SIZE; i++) {
+
+    if (!bb_trace_bits[i]) continue;
+    ret++;
+
+    fprintf(f, "%06u:%u\n", i, bb_trace_bits[i]);
+
+  }
+  
+  fclose(f);
+
+  printf("bbcov num=%d\n", ret);
+  return ret;
+
+}
+
+
 
 /* Write results. */
 
@@ -583,7 +644,7 @@ int main(int argc, char** argv) {
 
   doc_path = access(DOC_PATH, F_OK) ? "docs" : DOC_PATH;
 
-  while ((opt = getopt(argc,argv,"+o:m:t:A:eqZQ")) > 0)
+  while ((opt = getopt(argc,argv,"+o:m:t:A:b:eqZQ")) > 0)
 
     switch (opt) {
 
@@ -591,6 +652,12 @@ int main(int argc, char** argv) {
 
         if (out_file) FATAL("Multiple -o options not supported");
         out_file = optarg;
+        break;
+
+      case 'b':
+
+        if (bbcov_file) FATAL("Multiple -o options not supported");
+        bbcov_file = optarg;
         break;
 
       case 'm': {
@@ -717,6 +784,9 @@ int main(int argc, char** argv) {
     OKF("Captured %u tuples in '%s'." cRST, tcnt, out_file);
 
   }
+
+  if( bbcov_file )
+      write_bbcov_results();
 
   exit(child_crashed * 2 + child_timed_out);
 

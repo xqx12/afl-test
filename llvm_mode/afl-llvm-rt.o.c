@@ -39,7 +39,9 @@
    It will end up as .comm, so it shouldn't be too wasteful. */
 
 u8  __afl_area_initial[MAP_SIZE];
+u8  __afl_bbcov_initial[MAP_SIZE];
 u8* __afl_area_ptr = __afl_area_initial;
+u8* __afl_bbcov_ptr = __afl_bbcov_initial;
 
 __thread u32 __afl_prev_loc;
 
@@ -73,6 +75,24 @@ static void __afl_map_shm(void) {
        our parent doesn't give up on us. */
 
     __afl_area_ptr[0] = 1;
+
+  }
+
+  u8 *bb_id_str = getenv(BB_SHM_ENV_VAR);
+  if (bb_id_str) {
+
+    u32 bb_shm_id = atoi(bb_id_str);
+
+    __afl_bbcov_ptr = shmat(bb_shm_id, NULL, 0);
+
+    /* Whooooops. */
+
+    if (__afl_bbcov_ptr == (void *)-1) _exit(1);
+
+    /* Write something into the bitmap so that even with low AFL_INST_RATIO,
+       our parent doesn't give up on us. */
+
+    __afl_bbcov_ptr[0] = 1;
 
   }
 
