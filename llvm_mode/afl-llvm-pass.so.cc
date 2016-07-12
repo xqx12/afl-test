@@ -35,8 +35,11 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/DebugInfo.h"
 
 using namespace llvm;
+
+#define AFL_TMP_FILE  "/tmp/afl_tmp_file"
 
 namespace {
 
@@ -52,10 +55,101 @@ namespace {
       const char *getPassName() const override {
         return "American Fuzzy Lop Instrumentation";
       }
+      bool getInstructionDebugInfo(const llvm::Instruction *I, 
+              std::string &File,
+              unsigned &Line);
 
   };
 
 }
+
+static int readIndex(char* fd_file_name)
+{
+
+    FILE	*fd;										/* input-file pointer */
+    int index;
+
+    fd	= fopen( fd_file_name, "r" );
+    if ( fd == NULL ) {
+        fprintf ( stderr, "couldn't open file '%s'; %s\n",
+                fd_file_name, strerror(errno) );
+        return 0;
+    }
+
+    if( fscanf(fd, "%d", &index) != 1 )
+        return -1;
+
+    if( fclose(fd) == EOF ) {			/* close input file   */
+        fprintf ( stderr, "couldn't close file '%s'; %s\n",
+                fd_file_name, strerror(errno) );
+        exit (EXIT_FAILURE);
+    }
+
+    return index;
+}
+
+static int writeIndex(char* fd_file_name, int value)
+{
+
+    FILE	*fd;										/* output-file pointer */
+
+    fd	= fopen( fd_file_name, "w" );
+    if ( fd == NULL ) {
+        fprintf ( stderr, "couldn't open file '%s'; %s\n",
+                fd_file_name, strerror(errno) );
+        return -1;
+    }
+
+    if( fprintf( fd, "%d", value) != 1 )
+        return -1;
+
+    if( fclose(fd) == EOF ) {			/* close output file   */
+        fprintf ( stderr, "couldn't close file '%s'; %s\n",
+                fd_file_name, strerror(errno) );
+        exit (EXIT_FAILURE);
+    }
+
+    return 0;
+
+}
+
+static unsigned char* alloc_printf(const char* _str, ...) { 
+    unsigned char* _tmp; 
+    va_list ap;
+    va_start(ap, _str);
+    int _len = snprintf(NULL, 0, _str); 
+    if (_len < 0) FATAL("Whoa, snprintf() fails?!"); 
+    _tmp = (unsigned char*)malloc(_len + 1); 
+    snprintf((char*)_tmp, _len + 1, _str); 
+    va_end(ap);
+    return _tmp; 
+}
+
+static std::string getDSPIPath(DILocation Loc) {
+  std::string dir = Loc.getDirectory();
+  std::string file = Loc.getFilename();
+  if (dir.empty() || file[0] == '/') {
+    return file;
+  } else if (*dir.rbegin() == '/') {
+    return dir + file;
+  } else {
+    return dir + "/" + file;
+  }
+}
+
+bool AFLCoverage::getInstructionDebugInfo(const llvm::Instruction *I, 
+                                                   std::string &File,
+                                                   unsigned &Line) {
+  if (MDNode *N = I->getMetadata("dbg")) {
+    DILocation Loc(N);
+    File = getDSPIPath(Loc);
+    Line = Loc.getLineNumber();
+    return true;
+  }
+
+  return false;
+}
+
 
 
 char AFLCoverage::ID = 0;
@@ -91,6 +185,15 @@ bool AFLCoverage::runOnModule(Module &M) {
 
   }
 
+  int inst_blocks = 0;
+  inst_blocks = readIndex(AFL_TMP_FILE);
+  if( inst_blocks == -1 ) {
+      printf("error when readIndex\n");
+      exit(0);
+  }
+  srand(inst_blocks);
+
+
   /* Get globals for the SHM region and the previous location. Note that
      __afl_prev_loc is thread-local. */
 
@@ -104,7 +207,6 @@ bool AFLCoverage::runOnModule(Module &M) {
 
   /* Instrument all the things! */
 
-  int inst_blocks = 0;
 
   for (auto &F : M)
     for (auto &BB : F) {
@@ -117,7 +219,17 @@ bool AFLCoverage::runOnModule(Module &M) {
       /* Make up cur_loc */
 
       unsigned int cur_loc = R(MAP_SIZE);
+      printf("bbID=%d, mapID=%d, func=%s\n", inst_blocks, cur_loc, 
+              F.getName().str().c_str());
+      for (auto &II : BB) {
+          std::string filename;
+          unsigned line;
+          bool bRet = getInstructionDebugInfo( &II, filename, line);
+          if( bRet ) {
+              printf("%s:%d\n", filename.c_str(), line);
+          }
 
+      }
       ConstantInt *CurLoc = ConstantInt::get(Int32Ty, cur_loc);
 
       /* Load prev_loc */
@@ -151,6 +263,7 @@ bool AFLCoverage::runOnModule(Module &M) {
 
     }
 
+  writeIndex(AFL_TMP_FILE, inst_blocks);
   /* Say something nice. */
 
   if (!be_quiet) {

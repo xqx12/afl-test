@@ -8,6 +8,10 @@ afl-gotcpu
 afl-showmap
 afl-tmin
 afl-qemu-trace
+afl-analyze
+afl-clang-fast
+afl-clang-fast++
+afl-llvm-pass.so
 as
 qemu_mode/qemu*.tar.bz2
 qemu_mode/qemu-2.2.0/
