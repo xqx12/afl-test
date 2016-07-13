@@ -28,6 +28,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <set>
+#include <map>
 
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/IRBuilder.h"
@@ -36,6 +39,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/DebugInfo.h"
+
 
 using namespace llvm;
 
@@ -63,31 +67,6 @@ namespace {
 
 }
 
-static int readIndex(char* fd_file_name)
-{
-
-    FILE	*fd;										/* input-file pointer */
-    int index;
-
-    fd	= fopen( fd_file_name, "r" );
-    if ( fd == NULL ) {
-        fprintf ( stderr, "couldn't open file '%s'; %s\n",
-                fd_file_name, strerror(errno) );
-        return 0;
-    }
-
-    if( fscanf(fd, "%d", &index) != 1 )
-        return -1;
-
-    if( fclose(fd) == EOF ) {			/* close input file   */
-        fprintf ( stderr, "couldn't close file '%s'; %s\n",
-                fd_file_name, strerror(errno) );
-        exit (EXIT_FAILURE);
-    }
-
-    return index;
-}
-
 static int writeIndex(char* fd_file_name, int value)
 {
 
@@ -112,6 +91,44 @@ static int writeIndex(char* fd_file_name, int value)
     return 0;
 
 }
+
+static int readIndex(char* fd_file_name)
+{
+
+    FILE	*fd;										/* input-file pointer */
+    int index;
+    struct stat buf;
+
+    fd	= fopen( fd_file_name, "r" );
+    if ( fd == NULL ) {
+        fprintf ( stderr, "couldn't open file '%s'; %s\n",
+                fd_file_name, strerror(errno) );
+        return -2;
+    }
+
+    fstat(fileno(fd), &buf);
+    long modifyTime = buf.st_mtime;
+    long curTime = time((time_t*)NULL);
+    if( curTime - modifyTime > 10) {
+        printf("time-diff = %d\n", curTime-modifyTime);
+        fclose(fd);
+        writeIndex(fd_file_name, 0);
+        return 0;
+    }
+    
+
+    if( fscanf(fd, "%d", &index) != 1 )
+        return -1;
+
+    if( fclose(fd) == EOF ) {			/* close input file   */
+        fprintf ( stderr, "couldn't close file '%s'; %s\n",
+                fd_file_name, strerror(errno) );
+        exit (EXIT_FAILURE);
+    }
+
+    return index;
+}
+
 
 static unsigned char* alloc_printf(const char* _str, ...) { 
     unsigned char* _tmp; 
@@ -146,8 +163,12 @@ bool AFLCoverage::getInstructionDebugInfo(const llvm::Instruction *I,
     Line = Loc.getLineNumber();
     return true;
   }
+  else {
+      File="nofilefind";
+      Line = 0;
+      return false;
+  }
 
-  return false;
 }
 
 
@@ -210,18 +231,24 @@ bool AFLCoverage::runOnModule(Module &M) {
       0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
 
   /* Instrument all the things! */
+  typedef std::map<unsigned, std::set<unsigned> > BBSrcLineMapTy;
+  typedef std::map<llvm::Function*, BBSrcLineMapTy> FuncBBMapTy;
+  typedef std::map<std::string, FuncBBMapTy> srcBcMapTy;
+  srcBcMapTy srcBcMap;
 
 
-  for (auto &F : M)
+  for (auto &F : M) {
+    if( F.isDeclaration() ) continue;
+    //BasicBlock &entryBB = F.getEntryBlock();
     for (auto &BB : F) {
 
+      inst_blocks++;
       BasicBlock::iterator IP = BB.getFirstInsertionPt();
       IRBuilder<> IRB(&(*IP));
 
       if (R(100) >= inst_ratio) continue;
 
       /* Make up cur_loc */
-
       unsigned int cur_loc = R(MAP_SIZE);
       printf("bbID=%d, mapID=%d, func=%s\n", inst_blocks, cur_loc, 
               F.getName().str().c_str());
@@ -231,6 +258,9 @@ bool AFLCoverage::runOnModule(Module &M) {
           bool bRet = getInstructionDebugInfo( &II, filename, line);
           if( bRet ) {
               printf("%s:%d\n", filename.c_str(), line);
+              FuncBBMapTy  &funcBBMap = srcBcMap[filename];
+              BBSrcLineMapTy &bbSrcLineMap = funcBBMap[&F];
+              bbSrcLineMap[inst_blocks].insert(line);
           }
 
       }
@@ -277,11 +307,70 @@ bool AFLCoverage::runOnModule(Module &M) {
       IRB.CreateStore(BBIncr, MapBBPtrIdx)
           ->setMetadata(M.getMDKindID("nosanitize"), MDNode::get(C, None));
 
-      inst_blocks++;
 
     }
+  } //end for (auto F :M)
 
   writeIndex(AFL_TMP_FILE, inst_blocks);
+
+  /* dump to src-id.txt */
+  if( 1 ) {
+    FILE *fd;
+    char *file_name="src-id.txt";
+
+
+    /* check the file modify time , if 10s earlier than now, clear it  */
+    struct stat buf;
+    fd	= fopen( file_name, "r" );
+    if ( fd == NULL ) {
+        fprintf ( stderr, "couldn't open file '%s'; %s\n",
+                file_name, strerror(errno) );
+        return -2;
+    }
+    fstat(fileno(fd), &buf);
+    long modifyTime = buf.st_mtime;
+    long curTime = time((time_t*)NULL);
+    fclose(fd);
+
+    if( curTime - modifyTime > 10) 
+        fd = fopen(file_name, "w");
+    else
+        fd = fopen(file_name, "a+");
+
+    if(fd==NULL) {
+        fprintf ( stderr, "couldn't open file 'src-id.txt'; %s\n",
+                 strerror(errno) );
+        return -1;
+    }
+    srcBcMapTy::iterator sit = srcBcMap.begin(), sie = srcBcMap.end();
+    for( ; sit!=sie; sit++) {
+        std::string file = sit->first;
+        fprintf(fd, "File: %s\n", file.c_str());
+          //*srcInfoFile << "File: " << sit->first << "\n";
+          FuncBBMapTy::iterator fit = sit->second.begin(), fie = sit->second.end();
+          for(; fit!=fie; fit++) {
+              llvm::Function* f =  fit->first;
+              fprintf(fd, "Func: %s:\n", f->getName().str().c_str());
+              //*srcInfoFile << "Func: " << f->getNameStr() << ":\n";
+              BBSrcLineMapTy::iterator bit=fit->second.begin(), bie=fit->second.end();
+              for(; bit!=bie; bit++) {
+                  std::set<unsigned>::iterator it=bit->second.begin(), ie=bit->second.end();
+                  for(; it!=ie; it++) {
+                      if( *it == 0 ) continue;
+                      fprintf(fd, "%d  %d\n", bit->first, *it);
+                      //*srcInfoFile << bit->first << "  " << *it << "\n";
+                  }
+              }
+          }
+      }
+
+    if( fclose(fd) == EOF ) {			/* close output file   */
+        fprintf ( stderr, "couldn't close file 'src-id.txt'; %s\n",
+                 strerror(errno) );
+        exit (EXIT_FAILURE);
+    }
+  }
+
   /* Say something nice. */
 
   if (!be_quiet) {

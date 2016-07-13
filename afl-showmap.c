@@ -191,7 +191,7 @@ static u32 write_bbcov_results(void) {
     if (!bb_trace_bits[i]) continue;
     ret++;
 
-    fprintf(f, "%06u:%u\n", i, bb_trace_bits[i]);
+    fprintf(f, "0  %u  %u  0\n", i, bb_trace_bits[i]); // time, bbid, times, coverage. For being compatible with kleecov
 
   }
   
