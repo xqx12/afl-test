@@ -323,19 +323,21 @@ bool AFLCoverage::runOnModule(Module &M) {
     struct stat buf;
     fd	= fopen( file_name, "r" );
     if ( fd == NULL ) {
-        fprintf ( stderr, "couldn't open file '%s'; %s\n",
+        fprintf ( stderr, "'%s': %s, open again\n",
                 file_name, strerror(errno) );
-        return -2;
-    }
-    fstat(fileno(fd), &buf);
-    long modifyTime = buf.st_mtime;
-    long curTime = time((time_t*)NULL);
-    fclose(fd);
-
-    if( curTime - modifyTime > 10) 
         fd = fopen(file_name, "w");
-    else
-        fd = fopen(file_name, "a+");
+    }
+    else {
+        fstat(fileno(fd), &buf);
+        long modifyTime = buf.st_mtime;
+        long curTime = time((time_t*)NULL);
+        fclose(fd);
+
+        if( curTime - modifyTime > 10) 
+            fd = fopen(file_name, "w");
+        else
+            fd = fopen(file_name, "a+");
+    }
 
     if(fd==NULL) {
         fprintf ( stderr, "couldn't open file 'src-id.txt'; %s\n",

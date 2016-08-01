@@ -1,0 +1,11 @@
+File: /home/xqx/data/xqx/projects/afl-test/afl-fuzz/llvm_mode/../test-instr.c
+Func: main:
+1  21
+1  23
+1  25
+2  26
+2  27
+3  30
+4  31
+5  33
+6  35
