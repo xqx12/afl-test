@@ -49,9 +49,9 @@ namespace {
 
       bool runOnModule(Module &M) override;
 
-      const char *getPassName() const override {
-        return "American Fuzzy Lop Instrumentation";
-      }
+      // StringRef getPassName() const override {
+      //  return "American Fuzzy Lop Instrumentation";
+      // }
 
   };
 
