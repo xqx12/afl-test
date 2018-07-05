@@ -476,30 +476,37 @@ static void bind_to_free_cpu(void) {
 
   closedir(d);
 
-  for (i = 0; i < cpu_core_count; i++) if (!cpu_used[i]) break;
+  for (i = 0; i < cpu_core_count; i++) {
+    if (!cpu_used[i]) continue;
 
-  if (i == cpu_core_count) {
+    if (i == cpu_core_count) {
 
-    SAYF("\n" cLRD "[-] " cRST
-         "Uh-oh, looks like all %u CPU cores on your system are allocated to\n"
-         "    other instances of afl-fuzz (or similar CPU-locked tasks). Starting\n"
-         "    another fuzzer on this machine is probably a bad plan, but if you are\n"
-         "    absolutely sure, you can set AFL_NO_AFFINITY and try again.\n",
-         cpu_core_count);
+      SAYF("\n" cLRD "[-] " cRST
+          "Uh-oh, looks like all %u CPU cores on your system are allocated to\n"
+          "    other instances of afl-fuzz (or similar CPU-locked tasks). Starting\n"
+          "    another fuzzer on this machine is probably a bad plan, but if you are\n"
+          "    absolutely sure, you can set AFL_NO_AFFINITY and try again.\n",
+          cpu_core_count);
 
-    FATAL("No more free CPU cores");
+      FATAL("No more free CPU cores");
 
+    }
+
+    OKF("Found a free CPU core, binding to #%u.", i);
+
+    cpu_aff = i;
+
+    CPU_ZERO(&c);
+    CPU_SET(i, &c);
+
+    if (sched_setaffinity(0, sizeof(c), &c)) {
+      OKF("CPU#%u. sched_setaffinity failed, check next one..", i);
+      continue;
+      /*PFATAL("sched_setaffinitky failed");*/
+    }
+    OKF("Found a free CPU core, binding to #%u.", i);
+    break;
   }
-
-  OKF("Found a free CPU core, binding to #%u.", i);
-
-  cpu_aff = i;
-
-  CPU_ZERO(&c);
-  CPU_SET(i, &c);
-
-  if (sched_setaffinity(0, sizeof(c), &c))
-    PFATAL("sched_setaffinity failed");
 
 }
 
