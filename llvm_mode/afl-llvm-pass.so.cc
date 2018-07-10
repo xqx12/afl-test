@@ -40,7 +40,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
-#include "llvm/DebugInfo.h"
+#include "llvm/IR/DebugInfo.h"
 
 
 using namespace llvm;
@@ -58,7 +58,8 @@ namespace {
 
       bool runOnModule(Module &M) override;
 
-      const char *getPassName() const override {
+      //const char *getPassName() const override {
+      StringRef getPassName() const override {
         return "American Fuzzy Lop Instrumentation";
       }
       bool getInstructionDebugInfo(const llvm::Instruction *I, 
@@ -144,9 +145,9 @@ static unsigned char* alloc_printf(const char* _str, ...) {
     return _tmp; 
 }
 
-static std::string getDSPIPath(DILocation Loc) {
-  std::string dir = Loc.getDirectory();
-  std::string file = Loc.getFilename();
+static std::string getDSPIPath(DILocation *Loc) {
+  std::string dir = Loc->getDirectory();
+  std::string file = Loc->getFilename();
   if (dir.empty() || file[0] == '/') {
     return file;
   } else if (*dir.rbegin() == '/') {
@@ -159,10 +160,11 @@ static std::string getDSPIPath(DILocation Loc) {
 bool AFLCoverage::getInstructionDebugInfo(const llvm::Instruction *I, 
                                                    std::string &File,
                                                    unsigned &Line) {
-  if (MDNode *N = I->getMetadata("dbg")) {
-    DILocation Loc(N);
+  //if (MDNode *N = I->getMetadata("dbg")) {
+    //DILocation Loc(N);
+  if(DILocation *Loc = I->getDebugLoc()) {
     File = getDSPIPath(Loc);
-    Line = Loc.getLineNumber();
+    Line = Loc->getLine();
     return true;
   }
   else {
