@@ -22,6 +22,8 @@
 
  */
 
+#define AFL_LLVM_PASS
+
 #include "../config.h"
 #include "../debug.h"
 
@@ -246,10 +248,11 @@ bool AFLCoverage::runOnModule(Module &M) {
       BasicBlock::iterator IP = BB.getFirstInsertionPt();
       IRBuilder<> IRB(&(*IP));
 
-      if (R(100) >= inst_ratio) continue;
+      if (AFL_R(100) >= inst_ratio) continue;
 
       /* Make up cur_loc */
-      unsigned int cur_loc = R(MAP_SIZE);
+      //unsigned int cur_loc = R(MAP_SIZE);
+      unsigned int cur_loc = AFL_R(MAP_SIZE);
       printf("bbID=%d, mapID=%d, func=%s\n", inst_blocks, cur_loc, 
               F.getName().str().c_str());
       for (auto &II : BB) {
@@ -379,9 +382,9 @@ bool AFLCoverage::runOnModule(Module &M) {
 
     if (!inst_blocks) WARNF("No instrumentation targets found.");
     else OKF("Instrumented %u locations (%s mode, ratio %u%%).",
-             inst_blocks,
-             getenv("AFL_HARDEN") ? "hardened" : "non-hardened",
-             inst_ratio);
+             inst_blocks, getenv("AFL_HARDEN") ? "hardened" :
+             ((getenv("AFL_USE_ASAN") || getenv("AFL_USE_MSAN")) ?
+              "ASAN/MSAN" : "non-hardened"), inst_ratio);
 
   }
 

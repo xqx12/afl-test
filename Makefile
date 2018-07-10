@@ -4,7 +4,7 @@
 #
 # Written and maintained by Michal Zalewski <lcamtuf@google.com>
 # 
-# Copyright 2013, 2014, 2015, 2016 Google Inc. All rights reserved.
+# Copyright 2013, 2014, 2015, 2016, 2017 Google Inc. All rights reserved.
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ HELPER_PATH = $(PREFIX)/lib/afl
 DOC_PATH    = $(PREFIX)/share/doc/afl
 MISC_PATH   = $(PREFIX)/share/afl
 
-# PROGS intentionally omit afl-as, which gets installed to its own dir.
+# PROGS intentionally omit afl-as, which gets installed elsewhere.
 
 PROGS       = afl-gcc afl-fuzz afl-showmap afl-tmin afl-gotcpu afl-analyze
 SH_PROGS    = afl-plot afl-cmin afl-whatsup
@@ -111,9 +111,11 @@ all_done: test_build
 .NOTPARALLEL: clean
 
 clean:
-	rm -f $(PROGS) afl-as as afl-g++ afl-clang afl-clang++ *.o *~ a.out core core.[1-9][0-9]* *.stackdump test .test test-instr .test-instr0 .test-instr1 qemu_mode/qemu-2.3.0.tar.bz2 afl-qemu-trace
-	rm -rf out_dir qemu_mode/qemu-2.3.0
+	rm -f $(PROGS) afl-as as afl-g++ afl-clang afl-clang++ *.o *~ a.out core core.[1-9][0-9]* *.stackdump test .test test-instr .test-instr0 .test-instr1 qemu_mode/qemu-2.10.0.tar.bz2 afl-qemu-trace
+	rm -rf out_dir qemu_mode/qemu-2.10.0
 	$(MAKE) -C llvm_mode clean
+	$(MAKE) -C libdislocator clean
+	$(MAKE) -C libtokencap clean
 
 install: all
 	mkdir -p -m 755 $${DESTDIR}$(BIN_PATH) $${DESTDIR}$(HELPER_PATH) $${DESTDIR}$(DOC_PATH) $${DESTDIR}$(MISC_PATH)
@@ -121,7 +123,11 @@ install: all
 	install -m 755 $(PROGS) $(SH_PROGS) $${DESTDIR}$(BIN_PATH)
 	rm -f $${DESTDIR}$(BIN_PATH)/afl-as
 	if [ -f afl-qemu-trace ]; then install -m 755 afl-qemu-trace $${DESTDIR}$(BIN_PATH); fi
+ifndef AFL_TRACE_PC
 	if [ -f afl-clang-fast -a -f afl-llvm-pass.so -a -f afl-llvm-rt.o ]; then set -e; install -m 755 afl-clang-fast $${DESTDIR}$(BIN_PATH); ln -sf afl-clang-fast $${DESTDIR}$(BIN_PATH)/afl-clang-fast++; install -m 755 afl-llvm-pass.so afl-llvm-rt.o $${DESTDIR}$(HELPER_PATH); fi
+else
+	if [ -f afl-clang-fast -a -f afl-llvm-rt.o ]; then set -e; install -m 755 afl-clang-fast $${DESTDIR}$(BIN_PATH); ln -sf afl-clang-fast $${DESTDIR}$(BIN_PATH)/afl-clang-fast++; install -m 755 afl-llvm-rt.o $${DESTDIR}$(HELPER_PATH); fi
+endif
 	if [ -f afl-llvm-rt-32.o ]; then set -e; install -m 755 afl-llvm-rt-32.o $${DESTDIR}$(HELPER_PATH); fi
 	if [ -f afl-llvm-rt-64.o ]; then set -e; install -m 755 afl-llvm-rt-64.o $${DESTDIR}$(HELPER_PATH); fi
 	set -e; for i in afl-g++ afl-clang afl-clang++; do ln -sf afl-gcc $${DESTDIR}$(BIN_PATH)/$$i; done
@@ -129,6 +135,7 @@ install: all
 	ln -sf afl-as $${DESTDIR}$(HELPER_PATH)/as
 	install -m 644 docs/README docs/ChangeLog docs/*.txt $${DESTDIR}$(DOC_PATH)
 	cp -r testcases/ $${DESTDIR}$(MISC_PATH)
+	cp -r dictionaries/ $${DESTDIR}$(MISC_PATH)
 
 publish: clean
 	test "`basename $$PWD`" = "afl" || exit 1

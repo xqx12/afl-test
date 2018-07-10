@@ -4,7 +4,7 @@
 
    Written and maintained by Michal Zalewski <lcamtuf@google.com>
 
-   Copyright 2015, 2016 Google Inc. All rights reserved.
+   Copyright 2015, 2016, 2017 Google Inc. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -46,7 +46,8 @@
 
 static s32 child_pid;                 /* PID of the tested program         */
 
-static u8* trace_bits;                /* SHM with instrumentation bitmap   */
+static u8 *trace_bits,                /* SHM with instrumentation bitmap   */
+          *mask_bitmap;               /* Mask for trace bits (-B)          */
 
 static u8 *in_file,                   /* Minimizer input test case         */
           *out_file,                  /* Minimizer output file             */
@@ -72,6 +73,7 @@ static s32 shm_id,                    /* ID of the SHM region              */
 static u8  crash_mode,                /* Crash-centric mode?               */
            exit_crash,                /* Treat non-zero exit as crash?     */
            edges_only,                /* Ignore hit counts?                */
+           exact_mode,                /* Require path match for crashes?   */
            use_stdin = 1;             /* Use stdin for program input?      */
 
 static volatile u8
@@ -118,6 +120,25 @@ static void classify_counts(u8* mem) {
 }
 
 
+/* Apply mask to classified bitmap (if set). */
+
+static void apply_mask(u32* mem, u32* mask) {
+
+  u32 i = (MAP_SIZE >> 2);
+
+  if (!mask) return;
+
+  while (i--) {
+
+    *mem &= ~*mask;
+    mem++;
+    mask++;
+
+  }
+
+}
+
+
 /* See if any bytes are set in the bitmap. */
 
 static inline u8 anything_set(void) {
@@ -137,7 +158,7 @@ static inline u8 anything_set(void) {
 
 static void remove_shm(void) {
 
-  unlink(prog_in); /* Ignore errors */
+  if (prog_in) unlink(prog_in); /* Ignore errors */
   shmctl(shm_id, IPC_RMID, NULL);
 
 }
@@ -262,6 +283,8 @@ static u8 run_target(char** argv, u8* mem, u32 len, u8 first_run) {
     close(dev_null_fd);
     close(prog_in_fd);
 
+    setsid();
+
     if (mem_limit) {
 
       r.rlim_max = r.rlim_cur = ((rlim_t)mem_limit) << 20;
@@ -314,11 +337,15 @@ static u8 run_target(char** argv, u8* mem, u32 len, u8 first_run) {
     FATAL("Unable to execute '%s'", argv[0]);
 
   classify_counts(trace_bits);
+  apply_mask((u32*)trace_bits, (u32*)mask_bitmap);
   total_execs++;
 
   if (stop_soon) {
+
     SAYF(cRST cLRD "\n+++ Minimization aborted by user +++\n" cRST);
+    close(write_to_file(out_file, in_data, in_len));
     exit(1);
+
   }
 
   /* Always discard inputs that time out. */
@@ -340,7 +367,7 @@ static u8 run_target(char** argv, u8* mem, u32 len, u8 first_run) {
 
     if (crash_mode) {
 
-      return 1;
+      if (!exact_mode) return 1;
 
     } else {
 
@@ -349,7 +376,7 @@ static u8 run_target(char** argv, u8* mem, u32 len, u8 first_run) {
 
     }
 
-  }
+  } else
 
   /* Handle non-crashing inputs appropriately. */
 
@@ -649,14 +676,14 @@ static void set_up_environment(void) {
 
     u8* use_dir = ".";
 
-    if (!access(use_dir, R_OK | W_OK | X_OK)) {
+    if (access(use_dir, R_OK | W_OK | X_OK)) {
 
       use_dir = getenv("TMPDIR");
       if (!use_dir) use_dir = "/tmp";
 
-      prog_in = alloc_printf("%s/.afl-tmin-temp-%u", use_dir, getpid());
-
     }
+
+    prog_in = alloc_printf("%s/.afl-tmin-temp-%u", use_dir, getpid());
 
   }
 
@@ -698,8 +725,10 @@ static void set_up_environment(void) {
                          "allocator_may_return_null=1:"
                          "msan_track_origins=0", 0);
 
-  if (getenv("AFL_LD_PRELOAD"))
-    setenv("LD_PRELOAD", getenv("AFL_LD_PRELOAD"), 1);
+  if (getenv("AFL_PRELOAD")) {
+    setenv("LD_PRELOAD", getenv("AFL_PRELOAD"), 1);
+    setenv("DYLD_INSERT_LIBRARIES", getenv("AFL_PRELOAD"), 1);
+  }
 
 }
 
@@ -865,6 +894,10 @@ static char** get_qemu_argv(u8* own_loc, char** argv, int argc) {
   char** new_argv = ck_alloc(sizeof(char*) * (argc + 4));
   u8 *tmp, *cp, *rsl, *own_copy;
 
+  /* Workaround for a QEMU stability glitch. */
+
+  setenv("QEMU_LOG", "nochain", 1);
+
   memcpy(new_argv + 3, argv + 1, sizeof(char*) * argc);
 
   /* Now we need to actually find qemu for argv[0]. */
@@ -917,6 +950,22 @@ static char** get_qemu_argv(u8* own_loc, char** argv, int argc) {
 }
 
 
+/* Read mask bitmap from file. This is for the -B option. */
+
+static void read_bitmap(u8* fname) {
+
+  s32 fd = open(fname, O_RDONLY);
+
+  if (fd < 0) PFATAL("Unable to open '%s'", fname);
+
+  ck_read(fd, mask_bitmap, MAP_SIZE, fname);
+
+  close(fd);
+
+}
+
+
+
 /* Main entry point */
 
 int main(int argc, char** argv) {
@@ -929,7 +978,7 @@ int main(int argc, char** argv) {
 
   SAYF(cCYA "afl-tmin " cBRI VERSION cRST " by <lcamtuf@google.com>\n");
 
-  while ((opt = getopt(argc,argv,"+i:o:f:m:t:xeQ")) > 0)
+  while ((opt = getopt(argc,argv,"+i:o:f:m:t:B:xeQ")) > 0)
 
     switch (opt) {
 
@@ -1021,6 +1070,26 @@ int main(int argc, char** argv) {
         qemu_mode = 1;
         break;
 
+      case 'B': /* load bitmap */
+
+        /* This is a secret undocumented option! It is speculated to be useful
+           if you have a baseline "boring" input file and another "interesting"
+           file you want to minimize.
+
+           You can dump a binary bitmap for the boring file using
+           afl-showmap -b, and then load it into afl-tmin via -B. The minimizer
+           will then minimize to preserve only the edges that are unique to
+           the interesting input file, but ignoring everything from the
+           original map.
+
+           The option may be extended and made more official if it proves
+           to be useful. */
+
+        if (mask_bitmap) FATAL("Multiple -B options not supported");
+        mask_bitmap = ck_alloc(MAP_SIZE);
+        read_bitmap(optarg);
+        break;
+
       default:
 
         usage(argv[0]);
@@ -1041,6 +1110,8 @@ int main(int argc, char** argv) {
     use_argv = get_qemu_argv(argv[0], argv + optind, argc - optind);
   else
     use_argv = argv + optind;
+
+  exact_mode = !!getenv("AFL_TMIN_EXACT");
 
   SAYF("\n");
 
@@ -1063,14 +1134,17 @@ int main(int argc, char** argv) {
 
   } else {
 
-     OKF("Program exits with a signal, minimizing in " cMGN "crash" cRST
-         " mode.");
+     OKF("Program exits with a signal, minimizing in " cMGN "%scrash" cRST
+         " mode.", exact_mode ? "EXACT " : "");
 
   }
 
   minimize(use_argv);
 
   ACTF("Writing output to '%s'...", out_file);
+
+  unlink(prog_in);
+  prog_in = NULL;
 
   close(write_to_file(out_file, in_data, in_len));
 

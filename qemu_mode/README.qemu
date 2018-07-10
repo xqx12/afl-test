@@ -21,7 +21,7 @@ The idea and much of the implementation comes from Andrew Griffiths.
 2) How to use
 -------------
 
-The feature is implemented with a fairly simple patch to QEMU 2.3.0. The
+The feature is implemented with a fairly simple patch to QEMU 2.10.0. The
 simplest way to build it is to run ./build_qemu_support.sh. The script will
 download, configure, and compile the QEMU binary for you.
 
@@ -97,6 +97,11 @@ run out of memory.
 Compared to fully-fledged virtualization, the user emulation mode is *NOT* a
 security boundary. The binaries can freely interact with the host OS. If you
 somehow need to fuzz an untrusted binary, put everything in a sandbox first.
+
+QEMU does not necessarily support all CPU or hardware features that your
+target program may be utilizing. In particular, it does not appear to have
+full support for AVX2 / FMA3. Using binaries for older CPUs, or recompiling them
+with -march=core2, can help.
 
 Beyond that, this is an early-stage mechanism, so fields reports are welcome.
 You can send them to <afl-users@googlegroups.com>.

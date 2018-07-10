@@ -6,7 +6,7 @@
 
    Forkserver design by Jann Horn <jannhorn@googlemail.com>
 
-   Copyright 2013, 2014, 2015, 2016 Google Inc. All rights reserved.
+   Copyright 2013, 2014, 2015, 2016, 2017 Google Inc. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -92,7 +92,9 @@ EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *orig_cmdline;              /* Original command line            */
 
 EXP_ST u32 exec_tmout = EXEC_TIMEOUT; /* Configurable exec timeout (ms)   */
-EXP_ST u64 mem_limit = MEM_LIMIT;     /* Memory cap for child (MB)        */
+static u32 hang_tmout = EXEC_TIMEOUT; /* Timeout used for hang det (ms)   */
+
+EXP_ST u64 mem_limit  = MEM_LIMIT;    /* Memory cap for child (MB)        */
 
 static u32 stats_update_freq = 1;     /* Stats update frequency (execs)   */
 
@@ -112,12 +114,15 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            in_place_resume,           /* Attempt in-place resume?         */
            auto_changed,              /* Auto-generated tokens changed?   */
            no_cpu_meter_red,          /* Feng shui on the status screen   */
-           no_var_check,              /* Don't detect variable behavior   */
+           no_arith,                  /* Skip most arithmetic ops         */
            shuffle_queue,             /* Shuffle input queue?             */
            bitmap_changed = 1,        /* Time to update bitmap?           */
            qemu_mode,                 /* Running in QEMU mode?            */
            skip_requested,            /* Skip request, via SIGUSR1        */
-           run_over10m;               /* Run time over 10 minutes?        */
+           run_over10m,               /* Run time over 10 minutes?        */
+           persistent_mode,           /* Running in persistent mode?      */
+           deferred_mode,             /* Deferred forkserver mode?        */
+           fast_cal;                  /* Try to calibrate faster?         */
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
@@ -132,8 +137,10 @@ static s32 forksrv_pid,               /* PID of the fork server           */
 EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
 
 EXP_ST u8  virgin_bits[MAP_SIZE],     /* Regions yet untouched by fuzzing */
-           virgin_hang[MAP_SIZE],     /* Bits we haven't seen in hangs    */
+           virgin_tmout[MAP_SIZE],    /* Bits we haven't seen in tmouts   */
            virgin_crash[MAP_SIZE];    /* Bits we haven't seen in crashes  */
+
+static u8  var_bytes[MAP_SIZE];       /* Bytes that appear to be variable */
 
 static s32 shm_id;                    /* ID of the SHM region             */
 
@@ -154,18 +161,21 @@ EXP_ST u32 queued_paths,              /* Total number of queued testcases */
            cur_depth,                 /* Current path depth               */
            max_depth,                 /* Max path depth                   */
            useless_at_start,          /* Number of useless starting paths */
+           var_byte_count,            /* Bitmap bytes with var behavior   */
            current_entry,             /* Current queue entry ID           */
            havoc_div = 1;             /* Cycle count divisor for havoc    */
 
 EXP_ST u64 total_crashes,             /* Total number of crashes          */
            unique_crashes,            /* Crashes with unique signatures   */
-           total_hangs,               /* Total number of hangs            */
+           total_tmouts,              /* Total number of timeouts         */
+           unique_tmouts,             /* Timeouts with unique signatures  */
            unique_hangs,              /* Hangs with unique signatures     */
            total_execs,               /* Total execve() calls             */
            start_time,                /* Unix start time (ms)             */
            last_path_time,            /* Time for most recent path (ms)   */
            last_crash_time,           /* Time for most recent crash (ms)  */
            last_hang_time,            /* Time for most recent hang (ms)   */
+           last_crash_execs,          /* Exec counter at last crash       */
            queue_cycle,               /* Queue round counter              */
            cycles_wo_finds,           /* Cycles without any new paths     */
            trim_execs,                /* Execs done to trim input files   */
@@ -174,7 +184,7 @@ EXP_ST u64 total_crashes,             /* Total number of crashes          */
            blocks_eff_total,          /* Blocks subject to effector maps  */
            blocks_eff_select;         /* Blocks selected as fuzzable      */
 
-static u32 subseq_hangs;              /* Number of hangs in a row         */
+static u32 subseq_tmouts;             /* Number of timeouts in a row      */
 
 static u8 *stage_name = "init",       /* Name of the current fuzz stage   */
           *stage_short,               /* Short stage name                 */
@@ -182,6 +192,8 @@ static u8 *stage_name = "init",       /* Name of the current fuzz stage   */
 
 static s32 stage_cur, stage_max;      /* Stage progression                */
 static s32 splicing_with = -1;        /* Splicing with which test case?   */
+
+static u32 master_id, master_max;     /* Master instance job splitting    */
 
 static u32 syncing_case;              /* Syncing with case #...           */
 
@@ -302,7 +314,7 @@ enum {
 
 enum {
   /* 00 */ FAULT_NONE,
-  /* 01 */ FAULT_HANG,
+  /* 01 */ FAULT_TMOUT,
   /* 02 */ FAULT_CRASH,
   /* 03 */ FAULT_ERROR,
   /* 04 */ FAULT_NOINST,
@@ -391,7 +403,7 @@ static void bind_to_free_cpu(void) {
   u8 cpu_used[4096] = { 0 };
   u32 i;
 
-  if (!cpu_core_count) return;
+  if (cpu_core_count < 2) return;
 
   if (getenv("AFL_NO_AFFINITY")) {
 
@@ -1025,7 +1037,7 @@ static u32 count_non_255_bytes(u8* mem) {
 
 /* Destructively simplify trace by eliminating hit count information
    and replacing it with 0x80 or 0x01 depending on whether the tuple
-   is hit or not. Called on every new crash or hang, should be
+   is hit or not. Called on every new crash or timeout, should be
    reasonably fast. */
 
 static const u8 simplify_lookup[256] = { 
@@ -1116,7 +1128,7 @@ static const u8 count_class_lookup8[256] = {
 static u16 count_class_lookup16[65536];
 
 
-static void init_count_class16(void) {
+EXP_ST void init_count_class16(void) {
 
   u32 b1, b2;
 
@@ -1333,7 +1345,7 @@ EXP_ST void setup_shm(void) {
 
   if (!in_bitmap) memset(virgin_bits, 255, MAP_SIZE);
 
-  memset(virgin_hang, 255, MAP_SIZE);
+  memset(virgin_tmout, 255, MAP_SIZE);
   memset(virgin_crash, 255, MAP_SIZE);
 
   shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
@@ -2246,7 +2258,7 @@ EXP_ST void init_forkserver(char** argv) {
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
 
-static u8 run_target(char** argv) {
+static u8 run_target(char** argv, u32 timeout) {
 
   static struct itimerval it;
   static u32 prev_timed_out = 0;
@@ -2372,8 +2384,8 @@ static u8 run_target(char** argv) {
 
   /* Configure timeout, as requested by user, then wait for child to terminate. */
 
-  it.it_value.tv_sec = (exec_tmout / 1000);
-  it.it_value.tv_usec = (exec_tmout % 1000) * 1000;
+  it.it_value.tv_sec = (timeout / 1000);
+  it.it_value.tv_usec = (timeout % 1000) * 1000;
 
   setitimer(ITIMER_REAL, &it, NULL);
 
@@ -2396,7 +2408,8 @@ static u8 run_target(char** argv) {
 
   }
 
-  child_pid = 0;
+  if (!WIFSTOPPED(status)) child_pid = 0;
+
   it.it_value.tv_sec = 0;
   it.it_value.tv_usec = 0;
 
@@ -2422,11 +2435,14 @@ static u8 run_target(char** argv) {
 
   /* Report outcome to caller. */
 
-  if (child_timed_out) return FAULT_HANG;
-
   if (WIFSIGNALED(status) && !stop_soon) {
+
     kill_signal = WTERMSIG(status);
+
+    if (child_timed_out && kill_signal == SIGKILL) return FAULT_TMOUT;
+
     return FAULT_CRASH;
+
   }
 
   /* A somewhat nasty hack for MSAN, which doesn't support abort_on_error and
@@ -2515,10 +2531,15 @@ static void show_stats(void);
 static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
                          u32 handicap, u8 from_queue) {
 
-  u8  fault = 0, new_bits = 0, var_detected = 0, first_run = (q->exec_cksum == 0);
+  static u8 first_trace[MAP_SIZE];
+
+  u8  fault = 0, new_bits = 0, var_detected = 0,
+      first_run = (q->exec_cksum == 0);
+
   u64 start_us, stop_us;
 
-  s32 old_sc = stage_cur, old_sm = stage_max, old_tmout = exec_tmout;
+  s32 old_sc = stage_cur, old_sm = stage_max;
+  u32 use_tmout = exec_tmout;
   u8* old_sn = stage_name;
 
   /* Be a bit more generous about timeouts when resuming sessions, or when
@@ -2526,19 +2547,21 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
      to intermittent latency. */
 
   if (!from_queue || resuming_fuzz)
-    exec_tmout = MAX(exec_tmout + CAL_TMOUT_ADD,
-                     exec_tmout * CAL_TMOUT_PERC / 100);
+    use_tmout = MAX(exec_tmout + CAL_TMOUT_ADD,
+                    exec_tmout * CAL_TMOUT_PERC / 100);
 
   q->cal_failed++;
 
   stage_name = "calibration";
-  stage_max  = no_var_check ? CAL_CYCLES_NO_VAR : CAL_CYCLES;
+  stage_max  = fast_cal ? 3 : CAL_CYCLES;
 
   /* Make sure the forkserver is up before we do anything, and let's not
      count its spin-up time toward binary calibration. */
 
   if (dumb_mode != 1 && !no_forkserver && !forksrv_pid)
     init_forkserver(argv);
+
+  if (q->exec_cksum) memcpy(first_trace, trace_bits, MAP_SIZE);
 
   start_us = get_cur_time_us();
 
@@ -2550,7 +2573,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
     write_to_testcase(use_mem, q->len);
 
-    fault = run_target(argv);
+    fault = run_target(argv, use_tmout);
 
     /* stop_soon is set by the handler for Ctrl+C. When it's pressed,
        we want to bail out quickly. */
@@ -2569,12 +2592,29 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
       u8 hnb = has_new_bits(virgin_bits);
       if (hnb > new_bits) new_bits = hnb;
 
-      if (!no_var_check && q->exec_cksum) {
+      if (q->exec_cksum) {
+
+        u32 i;
+
+        for (i = 0; i < MAP_SIZE; i++) {
+
+          if (!var_bytes[i] && first_trace[i] != trace_bits[i]) {
+
+            var_bytes[i] = 1;
+            stage_max    = CAL_CYCLES_LONG;
+
+          }
+
+        }
 
         var_detected = 1;
-        stage_max    = CAL_CYCLES_LONG;
 
-      } else q->exec_cksum = cksum;
+      } else {
+
+        q->exec_cksum = cksum;
+        memcpy(first_trace, trace_bits, MAP_SIZE);
+
+      }
 
     }
 
@@ -2613,15 +2653,20 @@ abort_calibration:
 
   /* Mark variable paths. */
 
-  if (var_detected && !q->var_behavior) {
-    mark_as_variable(q);
-    queued_variable++;
+  if (var_detected) {
+
+    var_byte_count = count_bytes(var_bytes);
+
+    if (!q->var_behavior) {
+      mark_as_variable(q);
+      queued_variable++;
+    }
+
   }
 
   stage_name = old_sn;
   stage_cur  = old_sc;
   stage_max  = old_sm;
-  exec_tmout = old_tmout;
 
   if (!first_run) show_stats();
 
@@ -2694,7 +2739,7 @@ static void perform_dry_run(char** argv) {
 
         break;
 
-      case FAULT_HANG:
+      case FAULT_TMOUT:
 
         if (timeout_given) {
 
@@ -2703,7 +2748,7 @@ static void perform_dry_run(char** argv) {
              out. */
 
           if (timeout_given > 1) {
-            WARNF("Test case results in a hang (skipping)");
+            WARNF("Test case results in a timeout (skipping)");
             q->cal_failed = CAL_CHANCES;
             cal_failures++;
             break;
@@ -2717,7 +2762,7 @@ static void perform_dry_run(char** argv) {
                "    '+' at the end of the value passed to -t ('-t %u+').\n", exec_tmout,
                exec_tmout);
 
-          FATAL("Test case '%s' results in a hang", fn);
+          FATAL("Test case '%s' results in a timeout", fn);
 
         } else {
 
@@ -2729,7 +2774,7 @@ static void perform_dry_run(char** argv) {
                "    If this test case is just a fluke, the other option is to just avoid it\n"
                "    altogether, and find one that is less of a CPU hog.\n", exec_tmout);
 
-          FATAL("Test case '%s' results in a hang", fn);
+          FATAL("Test case '%s' results in a timeout", fn);
 
         }
 
@@ -3125,14 +3170,14 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
   switch (fault) {
 
-    case FAULT_HANG:
+    case FAULT_TMOUT:
 
-      /* Hangs are not very interesting, but we're still obliged to keep
+      /* Timeouts are not very interesting, but we're still obliged to keep
          a handful of samples. We use the presence of new bits in the
          hang-specific bitmap as a signal of uniqueness. In "dumb" mode, we
          just keep everything. */
 
-      total_hangs++;
+      total_tmouts++;
 
       if (unique_hangs >= KEEP_UNIQUE_HANG) return keeping;
 
@@ -3144,7 +3189,29 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
         simplify_trace((u32*)trace_bits);
 #endif /* ^__x86_64__ */
 
-        if (!has_new_bits(virgin_hang)) return keeping;
+        if (!has_new_bits(virgin_tmout)) return keeping;
+
+      }
+
+      unique_tmouts++;
+
+      /* Before saving, we make sure that it's a genuine hang by re-running
+         the target with a more generous timeout (unless the default timeout
+         is already generous). */
+
+      if (exec_tmout < hang_tmout) {
+
+        u8 new_fault;
+        write_to_testcase(mem, len);
+        new_fault = run_target(argv, hang_tmout);
+
+        /* A corner case that one user reported bumping into: increasing the
+           timeout actually uncovers a crash. Make sure we don't discard it if
+           so. */
+
+        if (!stop_soon && new_fault == FAULT_CRASH) goto keep_as_crash;
+
+        if (stop_soon || new_fault != FAULT_TMOUT) return keeping;
 
       }
 
@@ -3168,8 +3235,11 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
     case FAULT_CRASH:
 
-      /* This is handled in a manner roughly similar to hangs,
-         except for slightly different limits. */
+keep_as_crash:
+
+      /* This is handled in a manner roughly similar to timeouts,
+         except for slightly different limits and no need to re-run test
+         cases. */
 
       total_crashes++;
 
@@ -3204,6 +3274,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       unique_crashes++;
 
       last_crash_time = get_cur_time();
+      last_crash_execs = total_execs;
 
       break;
 
@@ -3252,10 +3323,10 @@ static u32 find_start_position(void) {
   i = read(fd, tmp, sizeof(tmp) - 1); (void)i; /* Ignore errors */
   close(fd);
 
-  off = strstr(tmp, "cur_path       : ");
+  off = strstr(tmp, "cur_path          : ");
   if (!off) return 0;
 
-  ret = atoi(off + 17);
+  ret = atoi(off + 20);
   if (ret >= queued_paths) ret = 0;
   return ret;
 
@@ -3301,9 +3372,9 @@ static void find_timeout(void) {
 
 /* Update stats file for unattended monitoring. */
 
-static void write_stats_file(double bitmap_cvg, double eps) {
+static void write_stats_file(double bitmap_cvg, double stability, double eps) {
 
-  static double last_bcvg, last_eps;
+  static double last_bcvg, last_stab, last_eps;
 
   u8* fn = alloc_printf("%s/fuzzer_stats", out_dir);
   s32 fd;
@@ -3322,46 +3393,58 @@ static void write_stats_file(double bitmap_cvg, double eps) {
   /* Keep last values in case we're called from another context
      where exec/sec stats and such are not readily available. */
 
-  if (!bitmap_cvg && !eps) {
+  if (!bitmap_cvg && !stability && !eps) {
     bitmap_cvg = last_bcvg;
+    stability  = last_stab;
     eps        = last_eps;
   } else {
     last_bcvg = bitmap_cvg;
+    last_stab = stability;
     last_eps  = eps;
   }
 
-  fprintf(f, "start_time     : %llu\n"
-             "last_update    : %llu\n"
-             "fuzzer_pid     : %u\n"
-             "cycles_done    : %llu\n"
-             "execs_done     : %llu\n"
-             "execs_per_sec  : %0.02f\n"
-             "paths_total    : %u\n"
-             "paths_favored  : %u\n"
-             "paths_found    : %u\n"
-             "paths_imported : %u\n"
-             "max_depth      : %u\n"
-             "cur_path       : %u\n"
-             "pending_favs   : %u\n"
-             "pending_total  : %u\n"
-             "variable_paths : %u\n"
-             "bitmap_cvg     : %0.02f%%\n"
-             "unique_crashes : %llu\n"
-             "unique_hangs   : %llu\n"
-             "last_path      : %llu\n"
-             "last_crash     : %llu\n"
-             "last_hang      : %llu\n"
-             "exec_timeout   : %u\n"
-             "afl_banner     : %s\n"
-             "afl_version    : " VERSION "\n"
-             "command_line   : %s\n",
+  fprintf(f, "start_time        : %llu\n"
+             "last_update       : %llu\n"
+             "fuzzer_pid        : %u\n"
+             "cycles_done       : %llu\n"
+             "execs_done        : %llu\n"
+             "execs_per_sec     : %0.02f\n"
+             "paths_total       : %u\n"
+             "paths_favored     : %u\n"
+             "paths_found       : %u\n"
+             "paths_imported    : %u\n"
+             "max_depth         : %u\n"
+             "cur_path          : %u\n" /* Must match find_start_position() */
+             "pending_favs      : %u\n"
+             "pending_total     : %u\n"
+             "variable_paths    : %u\n"
+             "stability         : %0.02f%%\n"
+             "bitmap_cvg        : %0.02f%%\n"
+             "unique_crashes    : %llu\n"
+             "unique_hangs      : %llu\n"
+             "last_path         : %llu\n"
+             "last_crash        : %llu\n"
+             "last_hang         : %llu\n"
+             "execs_since_crash : %llu\n"
+             "exec_timeout      : %u\n"
+             "afl_banner        : %s\n"
+             "afl_version       : " VERSION "\n"
+             "target_mode       : %s%s%s%s%s%s%s\n"
+             "command_line      : %s\n",
              start_time / 1000, get_cur_time() / 1000, getpid(),
              queue_cycle ? (queue_cycle - 1) : 0, total_execs, eps,
              queued_paths, queued_favored, queued_discovered, queued_imported,
              max_depth, current_entry, pending_favored, pending_not_fuzzed,
-             queued_variable, bitmap_cvg, unique_crashes, unique_hangs,
-             last_path_time / 1000, last_crash_time / 1000,
-             last_hang_time / 1000, exec_tmout, use_banner, orig_cmdline);
+             queued_variable, stability, bitmap_cvg, unique_crashes,
+             unique_hangs, last_path_time / 1000, last_crash_time / 1000,
+             last_hang_time / 1000, total_execs - last_crash_execs,
+             exec_tmout, use_banner,
+             qemu_mode ? "qemu " : "", dumb_mode ? " dumb " : "",
+             no_forkserver ? "no_forksrv " : "", crash_mode ? "crash " : "",
+             persistent_mode ? "persistent " : "", deferred_mode ? "deferred " : "",
+             (qemu_mode || dumb_mode || no_forkserver || crash_mode ||
+              persistent_mode || deferred_mode) ? "" : "default",
+             orig_cmdline);
              /* ignore errors */
 
   fclose(f);
@@ -3626,9 +3709,13 @@ static void maybe_delete_out_dir(void) {
   /* Okay, let's get the ball rolling! First, we need to get rid of the entries
      in <out_dir>/.synced/.../id:*, if any are present. */
 
-  fn = alloc_printf("%s/.synced", out_dir);
-  if (delete_files(fn, NULL)) goto dir_cleanup_failed;
-  ck_free(fn);
+  if (!in_place_resume) {
+
+    fn = alloc_printf("%s/.synced", out_dir);
+    if (delete_files(fn, NULL)) goto dir_cleanup_failed;
+    ck_free(fn);
+
+  }
 
   /* Next, we need to clean up <out_dir>/queue/.state/ subdirectories: */
 
@@ -3784,7 +3871,7 @@ static void show_stats(void) {
 
   static u64 last_stats_ms, last_plot_ms, last_ms, last_execs;
   static double avg_exec;
-  double t_byte_ratio;
+  double t_byte_ratio, stab_ratio;
 
   u64 cur_ms;
   u32 t_bytes, t_bits;
@@ -3837,12 +3924,17 @@ static void show_stats(void) {
   t_bytes = count_non_255_bytes(virgin_bits);
   t_byte_ratio = ((double)t_bytes * 100) / MAP_SIZE;
 
+  if (t_bytes) 
+    stab_ratio = 100 - ((double)var_byte_count) * 100 / t_bytes;
+  else
+    stab_ratio = 100;
+
   /* Roughly every minute, update fuzzer stats and save auto tokens. */
 
   if (cur_ms - last_stats_ms > STATS_UPDATE_SEC * 1000) {
 
     last_stats_ms = cur_ms;
-    write_stats_file(t_byte_ratio, avg_exec);
+    write_stats_file(t_byte_ratio, stab_ratio, avg_exec);
     save_auto();
     write_bitmap();
 
@@ -3859,7 +3951,7 @@ static void show_stats(void) {
 
   /* Honor AFL_EXIT_WHEN_DONE and AFL_BENCH_UNTIL_CRASH. */
 
-  if (!dumb_mode && cycles_wo_finds > 20 && !pending_not_fuzzed &&
+  if (!dumb_mode && cycles_wo_finds > 100 && !pending_not_fuzzed &&
       getenv("AFL_EXIT_WHEN_DONE")) stop_soon = 2;
 
   if (total_crashes && getenv("AFL_BENCH_UNTIL_CRASH")) stop_soon = 2;
@@ -3929,14 +4021,17 @@ static void show_stats(void) {
 
   } else {
 
+    u64 min_wo_finds = (cur_ms - last_path_time) / 1000 / 60;
+
     /* First queue cycle: don't stop now! */
-    if (queue_cycle == 1) strcpy(tmp, cMGN); else
+    if (queue_cycle == 1 || min_wo_finds < 15) strcpy(tmp, cMGN); else
 
     /* Subsequent cycles, but we're still making finds. */
-    if (cycles_wo_finds < 3) strcpy(tmp, cYEL); else
+    if (cycles_wo_finds < 25 || min_wo_finds < 30) strcpy(tmp, cYEL); else
 
     /* No finds for a long time and no test cases to try. */
-    if (cycles_wo_finds > 20 && !pending_not_fuzzed) strcpy(tmp, cLGN);
+    if (cycles_wo_finds > 100 && !pending_not_fuzzed && min_wo_finds > 120)
+      strcpy(tmp, cLGN);
 
     /* Default: cautiously OK to stop? */
     else strcpy(tmp, cLBL);
@@ -4004,8 +4099,8 @@ static void show_stats(void) {
 
   SAYF(bV bSTOP "  now processing : " cRST "%-17s " bSTG bV bSTOP, tmp);
 
-
-  sprintf(tmp, "%s (%0.02f%%)", DI(t_bytes), t_byte_ratio);
+  sprintf(tmp, "%0.02f%% / %0.02f%%", ((double)queue_cur->bitmap_size) * 
+          100 / MAP_SIZE, t_byte_ratio);
 
   SAYF("    map density : %s%-21s " bSTG bV "\n", t_byte_ratio > 70 ? cLRD : 
        ((t_bytes < 200 && !dumb_mode) ? cPIN : cRST), tmp);
@@ -4082,10 +4177,10 @@ static void show_stats(void) {
 
   }
 
-  sprintf(tmp, "%s (%s%s unique)", DI(total_hangs), DI(unique_hangs),
+  sprintf(tmp, "%s (%s%s unique)", DI(total_tmouts), DI(unique_tmouts),
           (unique_hangs >= KEEP_UNIQUE_HANG) ? "+" : "");
 
-  SAYF (bSTG bV bSTOP "   total hangs : " cRST "%-22s " bSTG bV "\n", tmp);
+  SAYF (bSTG bV bSTOP "  total tmouts : " cRST "%-22s " bSTG bV "\n", tmp);
 
   /* Aaaalmost there... hold on! */
 
@@ -4149,9 +4244,14 @@ static void show_stats(void) {
           DI(stage_finds[STAGE_HAVOC]), DI(stage_cycles[STAGE_HAVOC]),
           DI(stage_finds[STAGE_SPLICE]), DI(stage_cycles[STAGE_SPLICE]));
 
-  SAYF(bV bSTOP "       havoc : " cRST "%-37s " bSTG bV bSTOP 
-       "  variable : %s%-10s " bSTG bV "\n", tmp, queued_variable ? cLRD : cRST,
-      no_var_check ? (u8*)"n/a" : DI(queued_variable));
+  SAYF(bV bSTOP "       havoc : " cRST "%-37s " bSTG bV bSTOP, tmp);
+
+  if (t_bytes) sprintf(tmp, "%0.02f%%", stab_ratio);
+    else strcpy(tmp, "n/a");
+
+  SAYF(" stability : %s%-10s " bSTG bV "\n", (stab_ratio < 85 && var_byte_count > 40) 
+       ? cLRD : ((queued_variable && (!persistent_mode || var_byte_count > 20))
+       ? cMGN : cRST), tmp);
 
   if (!bytes_trim_out) {
 
@@ -4333,12 +4433,19 @@ static void show_init_stats(void) {
 
   }
 
+  /* In dumb mode, re-running every timing out test case with a generous time
+     limit is very expensive, so let's select a more conservative default. */
+
+  if (dumb_mode && !getenv("AFL_HANG_TMOUT"))
+    hang_tmout = MIN(EXEC_TIMEOUT, exec_tmout * 2 + 100);
+
   OKF("All set and ready to roll!");
 
 }
 
 
-/* Find first power of two greater or equal to val. */
+/* Find first power of two greater or equal to val (assuming val under
+   2^31). */
 
 static u32 next_p2(u32 val) {
 
@@ -4397,7 +4504,7 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
 
       write_with_gap(in_buf, q->len, remove_pos, trim_avail);
 
-      fault = run_target(argv);
+      fault = run_target(argv, exec_tmout);
       trim_execs++;
 
       if (stop_soon || fault == FAULT_ERROR) goto abort_trimming;
@@ -4465,8 +4572,6 @@ static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
 
   }
 
-
-
 abort_trimming:
 
   bytes_trim_out += q->len;
@@ -4492,18 +4597,18 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   write_to_testcase(out_buf, len);
 
-  fault = run_target(argv);
+  fault = run_target(argv, exec_tmout);
 
   if (stop_soon) return 1;
 
-  if (fault == FAULT_HANG) {
+  if (fault == FAULT_TMOUT) {
 
-    if (subseq_hangs++ > HANG_LIMIT) {
+    if (subseq_tmouts++ > TMOUT_LIMIT) {
       cur_skipped_paths++;
       return 1;
     }
 
-  } else subseq_hangs = 0;
+  } else subseq_tmouts = 0;
 
   /* Users can hit us with SIGUSR1 to request the current input
      to be abandoned. */
@@ -4548,9 +4653,19 @@ static u32 choose_block_len(u32 limit) {
              max_value = HAVOC_BLK_MEDIUM;
              break;
 
-    default: min_value = HAVOC_BLK_MEDIUM;
-             max_value = HAVOC_BLK_LARGE;
+    default: 
 
+             if (UR(10)) {
+
+               min_value = HAVOC_BLK_MEDIUM;
+               max_value = HAVOC_BLK_LARGE;
+
+             } else {
+
+               min_value = HAVOC_BLK_LARGE;
+               max_value = HAVOC_BLK_XL;
+
+             }
 
   }
 
@@ -4617,9 +4732,9 @@ static u32 calculate_score(struct queue_entry* q) {
 
     case 0 ... 3:   break;
     case 4 ... 7:   perf_score *= 2; break;
-    case 8 ... 13:  perf_score *= 4; break;
-    case 14 ... 25: perf_score *= 6; break;
-    default:        perf_score *= 8;
+    case 8 ... 13:  perf_score *= 3; break;
+    case 14 ... 25: perf_score *= 4; break;
+    default:        perf_score *= 5;
 
   }
 
@@ -4829,7 +4944,7 @@ static u8 fuzz_one(char** argv) {
   u64 havoc_queued,  orig_hit_cnt, new_hit_cnt;
   u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1;
 
-  u8  ret_val = 1;
+  u8  ret_val = 1, doing_det = 0;
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
@@ -4872,8 +4987,11 @@ static u8 fuzz_one(char** argv) {
 
 #endif /* ^IGNORE_FINDS */
 
-  if (not_on_tty)
-    ACTF("Fuzzing test case #%u (%u total)...", current_entry, queued_paths);
+  if (not_on_tty) {
+    ACTF("Fuzzing test case #%u (%u total, %llu uniq crashes found)...",
+         current_entry, queued_paths, unique_crashes);
+    fflush(stdout);
+  }
 
   /* Map the test case into memory. */
 
@@ -4895,7 +5013,7 @@ static u8 fuzz_one(char** argv) {
 
   out_buf = ck_alloc_nozero(len);
 
-  subseq_hangs = 0;
+  subseq_tmouts = 0;
 
   cur_depth = queue_cur->depth;
 
@@ -4905,7 +5023,7 @@ static u8 fuzz_one(char** argv) {
 
   if (queue_cur->cal_failed) {
 
-    u8 res = FAULT_HANG;
+    u8 res = FAULT_TMOUT;
 
     if (queue_cur->cal_failed < CAL_CHANCES) {
 
@@ -4961,6 +5079,14 @@ static u8 fuzz_one(char** argv) {
 
   if (skip_deterministic || queue_cur->was_fuzzed || queue_cur->passed_det)
     goto havoc_stage;
+
+  /* Skip deterministic fuzzing if exec path checksum puts this out of scope
+     for this master instance. */
+
+  if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1)
+    goto havoc_stage;
+
+  doing_det = 1;
 
   /*********************************************
    * SIMPLE BITFLIP (+dictionary construction) *
@@ -5068,8 +5194,6 @@ static u8 fuzz_one(char** argv) {
   stage_finds[STAGE_FLIP1]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP1] += stage_max;
 
-  if (queue_cur->passed_det) goto havoc_stage;
-
   /* Two walking bits. */
 
   stage_name  = "bitflip 2/1";
@@ -5131,7 +5255,7 @@ static u8 fuzz_one(char** argv) {
   /* Effector map setup. These macros calculate:
 
      EFF_APOS      - position of a particular file offset in the map.
-     EFF_ALEN      - length of n map with a particular number of bytes.
+     EFF_ALEN      - length of a map with a particular number of bytes.
      EFF_SPAN_ALEN - map span for a sequence of bytes.
 
    */
@@ -5294,6 +5418,8 @@ static u8 fuzz_one(char** argv) {
   stage_cycles[STAGE_FLIP32] += stage_max;
 
 skip_bitflip:
+
+  if (no_arith) goto skip_arith;
 
   /**********************
    * ARITHMETIC INC/DEC *
@@ -5492,7 +5618,7 @@ skip_bitflip:
       /* Little endian first. Same deal as with 16-bit: we only want to
          try if the operation would have effect on more than two bytes. */
 
-      stage_val_type = STAGE_VAL_LE; 
+      stage_val_type = STAGE_VAL_LE;
 
       if ((orig & 0xffff) + j > 0xffff && !could_be_bitflip(r1)) {
 
@@ -5608,7 +5734,7 @@ skip_arith:
 
   /* Setting 16-bit integers, both endians. */
 
-  if (len < 2) goto skip_interest;
+  if (no_arith || len < 2) goto skip_interest;
 
   stage_name  = "interest 16/8";
   stage_short = "int16";
@@ -5820,7 +5946,7 @@ skip_interest:
 
   ex_tmp = ck_alloc(len + MAX_DICT_FILE);
 
-  for (i = 0; i < len; i++) {
+  for (i = 0; i <= len; i++) {
 
     stage_cur_byte = i;
 
@@ -5932,7 +6058,8 @@ havoc_stage:
 
     stage_name  = "havoc";
     stage_short = "havoc";
-    stage_max   = HAVOC_CYCLES * perf_score / havoc_div / 100;
+    stage_max   = (doing_det ? HAVOC_CYCLES_INIT : HAVOC_CYCLES) *
+                  perf_score / havoc_div / 100;
 
   } else {
 
@@ -6168,16 +6295,26 @@ havoc_stage:
 
         case 13:
 
-          if (temp_len + HAVOC_BLK_LARGE < MAX_FILE) {
+          if (temp_len + HAVOC_BLK_XL < MAX_FILE) {
 
             /* Clone bytes (75%) or insert a block of constant bytes (25%). */
 
+            u8  actually_clone = UR(4);
             u32 clone_from, clone_to, clone_len;
             u8* new_buf;
 
-            clone_len  = choose_block_len(temp_len);
+            if (actually_clone) {
 
-            clone_from = UR(temp_len - clone_len + 1);
+              clone_len  = choose_block_len(temp_len);
+              clone_from = UR(temp_len - clone_len + 1);
+
+            } else {
+
+              clone_len = choose_block_len(HAVOC_BLK_XL);
+              clone_from = 0;
+
+            }
+
             clone_to   = UR(temp_len);
 
             new_buf = ck_alloc_nozero(temp_len + clone_len);
@@ -6188,10 +6325,11 @@ havoc_stage:
 
             /* Inserted part */
 
-            if (UR(4))
+            if (actually_clone)
               memcpy(new_buf + clone_to, out_buf + clone_from, clone_len);
             else
-              memset(new_buf + clone_to, UR(256), clone_len);
+              memset(new_buf + clone_to,
+                     UR(2) ? UR(256) : out_buf[UR(temp_len)], clone_len);
 
             /* Tail */
             memcpy(new_buf + clone_to + clone_len, out_buf + clone_to,
@@ -6224,7 +6362,8 @@ havoc_stage:
               if (copy_from != copy_to)
                 memmove(out_buf + copy_to, out_buf + copy_from, copy_len);
 
-            } else memset(out_buf + copy_to, UR(256), copy_len);
+            } else memset(out_buf + copy_to,
+                          UR(2) ? UR(256) : out_buf[UR(temp_len)], copy_len);
 
             break;
 
@@ -6272,7 +6411,7 @@ havoc_stage:
 
         case 16: {
 
-            u32 use_extra, extra_len, insert_at = UR(temp_len);
+            u32 use_extra, extra_len, insert_at = UR(temp_len + 1);
             u8* new_buf;
 
             /* Insert an extra. Do the same dice-rolling stuff as for the
@@ -6562,8 +6701,14 @@ static void sync_fuzzers(char** argv) {
 
       path = alloc_printf("%s/%s", qd_path, qd_ent->d_name);
 
+      /* Allow this to fail in case the other fuzzer is resuming or so... */
+
       fd = open(path, O_RDONLY);
-      if (fd < 0) PFATAL("Unable to open '%s'", path);
+
+      if (fd < 0) {
+         ck_free(path);
+         continue;
+      }
 
       if (fstat(fd, &st)) PFATAL("fstat() failed");
 
@@ -6581,7 +6726,7 @@ static void sync_fuzzers(char** argv) {
 
         write_to_testcase(mem, st.st_size);
 
-        fault = run_target(argv);
+        fault = run_target(argv, exec_tmout);
 
         if (stop_soon) return;
 
@@ -6797,7 +6942,7 @@ EXP_ST void check_binary(u8* fname) {
 
     OKF(cPIN "Persistent mode binary detected.");
     setenv(PERSIST_ENV_VAR, "1", 1);
-    no_var_check = 1;
+    persistent_mode = 1;
 
   } else if (getenv("AFL_PERSISTENT")) {
 
@@ -6809,6 +6954,7 @@ EXP_ST void check_binary(u8* fname) {
 
     OKF(cPIN "Deferred forkserver binary detected.");
     setenv(DEFER_ENV_VAR, "1", 1);
+    deferred_mode = 1;
 
   } else if (getenv("AFL_DEFER_FORKSRV")) {
 
@@ -6856,6 +7002,12 @@ static void fix_up_banner(u8* name) {
 static void check_if_tty(void) {
 
   struct winsize ws;
+
+  if (getenv("AFL_NO_UI")) {
+    OKF("Disabling the UI because AFL_NO_UI is set.");
+    not_on_tty = 1;
+    return;
+  }
 
   if (ioctl(1, TIOCGWINSZ, &ws)) {
 
@@ -7002,7 +7154,10 @@ EXP_ST void setup_dirs_fds(void) {
   if (sync_id) {
 
     tmp = alloc_printf("%s/.synced/", out_dir);
-    if (mkdir(tmp, 0700)) PFATAL("Unable to create '%s'", tmp);
+
+    if (mkdir(tmp, 0700) && (!in_place_resume || errno != EEXIST))
+      PFATAL("Unable to create '%s'", tmp);
+
     ck_free(tmp);
 
   }
@@ -7081,7 +7236,7 @@ static void check_crash_handling(void) {
        "    external crash reporting utility. This will cause issues due to the\n"
        "    extended delay between the fuzzed binary malfunctioning and this fact\n"
        "    being relayed to the fuzzer via the standard waitpid() API.\n\n"
-       "    To avoid having crashes misinterpreted as hangs, please run the\n" 
+       "    To avoid having crashes misinterpreted as timeouts, please run the\n" 
        "    following commands:\n\n"
 
        "    SL=/System/Library; PL=com.apple.ReportCrash\n"
@@ -7111,7 +7266,7 @@ static void check_crash_handling(void) {
          "    between stumbling upon a crash and having this information relayed to the\n"
          "    fuzzer via the standard waitpid() API.\n\n"
 
-         "    To avoid having crashes misinterpreted as hangs, please log in as root\n" 
+         "    To avoid having crashes misinterpreted as timeouts, please log in as root\n" 
          "    and temporarily modify /proc/sys/kernel/core_pattern, like so:\n\n"
 
          "    echo core >/proc/sys/kernel/core_pattern\n");
@@ -7243,8 +7398,9 @@ static void get_core_count(void) {
 
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
 
-    OKF("You have %u CPU cores and %u runnable tasks (utilization: %0.0f%%).",
-        cpu_core_count, cur_runnable, cur_runnable * 100.0 / cpu_core_count);
+    OKF("You have %u CPU core%s and %u runnable tasks (utilization: %0.0f%%).",
+        cpu_core_count, cpu_core_count > 1 ? "s" : "",
+        cur_runnable, cur_runnable * 100.0 / cpu_core_count);
 
     if (cpu_core_count > 1) {
 
@@ -7449,6 +7605,10 @@ static char** get_qemu_argv(u8* own_loc, char** argv, int argc) {
   char** new_argv = ck_alloc(sizeof(char*) * (argc + 4));
   u8 *tmp, *cp, *rsl, *own_copy;
 
+  /* Workaround for a QEMU stability glitch. */
+
+  setenv("QEMU_LOG", "nochain", 1);
+
   memcpy(new_argv + 3, argv + 1, sizeof(char*) * argc);
 
   new_argv[2] = target_path;
@@ -7567,7 +7727,7 @@ int main(int argc, char** argv) {
 
     switch (opt) {
 
-      case 'i':
+      case 'i': /* input dir */
 
         if (in_dir) FATAL("Multiple -i options not supported");
         in_dir = optarg;
@@ -7582,15 +7742,33 @@ int main(int argc, char** argv) {
         out_dir = optarg;
         break;
 
-      case 'M':
+      case 'M': { /* master sync ID */
 
-        force_deterministic = 1;
-        /* Fall through */
+          u8* c;
 
-      case 'S': /* sync ID */
+          if (sync_id) FATAL("Multiple -S or -M options not supported");
+          sync_id = ck_strdup(optarg);
+
+          if ((c = strchr(sync_id, ':'))) {
+
+            *c = 0;
+
+            if (sscanf(c + 1, "%u/%u", &master_id, &master_max) != 2 ||
+                !master_id || !master_max || master_id > master_max ||
+                master_max > 1000000) FATAL("Bogus master ID passed to -M");
+
+          }
+
+          force_deterministic = 1;
+
+        }
+
+        break;
+
+      case 'S': 
 
         if (sync_id) FATAL("Multiple -S or -M options not supported");
-        sync_id = optarg;
+        sync_id = ck_strdup(optarg);
         break;
 
       case 'f': /* target file */
@@ -7599,13 +7777,13 @@ int main(int argc, char** argv) {
         out_file = optarg;
         break;
 
-      case 'x':
+      case 'x': /* dictionary */
 
         if (extras_dir) FATAL("Multiple -x options not supported");
         extras_dir = optarg;
         break;
 
-      case 't': {
+      case 't': { /* timeout */
 
           u8 suffix = 0;
 
@@ -7622,7 +7800,7 @@ int main(int argc, char** argv) {
 
       }
 
-      case 'm': {
+      case 'm': { /* mem limit */
 
           u8 suffix = 'M';
 
@@ -7659,14 +7837,14 @@ int main(int argc, char** argv) {
 
         break;
 
-      case 'd':
+      case 'd': /* skip deterministic */
 
         if (skip_deterministic) FATAL("Multiple -d options not supported");
         skip_deterministic = 1;
         use_splicing = 1;
         break;
 
-      case 'B':
+      case 'B': /* load bitmap */
 
         /* This is a secret undocumented option! It is useful if you find
            an interesting test case during a normal fuzzing process, and want
@@ -7685,26 +7863,26 @@ int main(int argc, char** argv) {
         read_bitmap(in_bitmap);
         break;
 
-      case 'C':
+      case 'C': /* crash mode */
 
         if (crash_mode) FATAL("Multiple -C options not supported");
         crash_mode = FAULT_CRASH;
         break;
 
-      case 'n':
+      case 'n': /* dumb mode */
 
         if (dumb_mode) FATAL("Multiple -n options not supported");
         if (getenv("AFL_DUMB_FORKSRV")) dumb_mode = 2; else dumb_mode = 1;
 
         break;
 
-      case 'T':
+      case 'T': /* banner */
 
         if (use_banner) FATAL("Multiple -T options not supported");
         use_banner = optarg;
         break;
 
-      case 'Q':
+      case 'Q': /* QEMU mode */
 
         if (qemu_mode) FATAL("Multiple -Q options not supported");
         qemu_mode = 1;
@@ -7738,14 +7916,25 @@ int main(int argc, char** argv) {
 
   if (getenv("AFL_NO_FORKSRV"))    no_forkserver    = 1;
   if (getenv("AFL_NO_CPU_RED"))    no_cpu_meter_red = 1;
-  if (getenv("AFL_NO_VAR_CHECK"))  no_var_check     = 1;
+  if (getenv("AFL_NO_ARITH"))      no_arith         = 1;
   if (getenv("AFL_SHUFFLE_QUEUE")) shuffle_queue    = 1;
+  if (getenv("AFL_FAST_CAL"))      fast_cal         = 1;
+
+  if (getenv("AFL_HANG_TMOUT")) {
+    hang_tmout = atoi(getenv("AFL_HANG_TMOUT"));
+    if (!hang_tmout) FATAL("Invalid value of AFL_HANG_TMOUT");
+  }
 
   if (dumb_mode == 2 && no_forkserver)
     FATAL("AFL_DUMB_FORKSRV and AFL_NO_FORKSRV are mutually exclusive");
 
+  if (getenv("AFL_PRELOAD")) {
+    setenv("LD_PRELOAD", getenv("AFL_PRELOAD"), 1);
+    setenv("DYLD_INSERT_LIBRARIES", getenv("AFL_PRELOAD"), 1);
+  }
+
   if (getenv("AFL_LD_PRELOAD"))
-    setenv("LD_PRELOAD", getenv("AFL_LD_PRELOAD"), 1);
+    FATAL("Use AFL_PRELOAD instead of AFL_LD_PRELOAD");
 
   save_cmdline(argc, argv);
 
@@ -7797,7 +7986,7 @@ int main(int argc, char** argv) {
 
   seek_to = find_start_position();
 
-  write_stats_file(0, 0);
+  write_stats_file(0, 0, 0);
   save_auto();
 
   if (stop_soon) goto stop_fuzzing;
@@ -7873,13 +8062,13 @@ int main(int argc, char** argv) {
   if (queue_cur) show_stats();
 
   write_bitmap();
-  write_stats_file(0, 0);
+  write_stats_file(0, 0, 0);
   save_auto();
 
 stop_fuzzing:
 
   SAYF(CURSOR_SHOW cLRD "\n\n+++ Testing aborted %s +++\n" cRST,
-       stop_soon == 2 ? "programatically" : "by user");
+       stop_soon == 2 ? "programmatically" : "by user");
 
   /* Running for more than 30 minutes but still doing first cycle? */
 
@@ -7895,6 +8084,7 @@ stop_fuzzing:
   destroy_queue();
   destroy_extras();
   ck_free(target_path);
+  ck_free(sync_id);
 
   alloc_report();
 
