@@ -12,6 +12,8 @@ afl-analyze
 afl-clang-fast
 afl-clang-fast++
 afl-llvm-pass.so
+afl-sinfo-count
+afl-sinfo-pass.so
 as
 qemu_mode/qemu*.tar.bz2
 qemu_mode/qemu-2.2.0/
@@ -32,3 +34,5 @@ cscope*
 tags
 *.swp
 *.swo
+llvm_mode/src-id.txt
+

@@ -230,6 +230,7 @@ static u32 write_results(void) {
   u8  cco = !!getenv("AFL_CMIN_CRASHES_ONLY"),
       caa = !!getenv("AFL_CMIN_ALLOW_ANY");
 
+  if (!strncmp(out_file, "/dev/", 5)) {
 
     fd = open(out_file, O_WRONLY, 0600);
     if (fd < 0) PFATAL("Unable to open '%s'", out_file);
