@@ -349,6 +349,13 @@ int main(int argc, char** argv) {
 
   edit_params(argc, argv);
 
+  SAYF("prog=%s", cc_params[0]);
+  int i=1;
+  while(cc_params[i]!=NULL) {
+    SAYF("para[%d]=%s\n",i, cc_params[i]);
+    i++;
+  }
+
   execvp(cc_params[0], (char**)cc_params);
 
   FATAL("Oops, failed to execute '%s' - check your PATH", cc_params[0]);
